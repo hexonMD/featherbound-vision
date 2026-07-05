@@ -3,7 +3,7 @@ FROM python:3.11-slim
 WORKDIR /app
 ENV HF_HOME=/app/hfcache HF_HUB_DISABLE_TELEMETRY=1 PYTHONUNBUFFERED=1
 
-RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu \
  && pip install --no-cache-dir open_clip_torch fastapi "uvicorn[standard]" pillow numpy python-multipart
 
 COPY bird_bank.npz app.py ./
