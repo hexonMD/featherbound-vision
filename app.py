@@ -50,12 +50,16 @@ def _resize_b64(raw: bytes, maxside: int = 1024) -> str:
     return base64.b64encode(b.getvalue()).decode()
 
 
+def _demd(s: str) -> str:
+    return s.replace("*", "").replace("_", "").strip()
+
+
 def _parse_gemini(text: str):
     out = []
     for ln in text.splitlines():
         m = _LINE.match(ln)
         if m:
-            out.append({"common": m.group(1).strip(), "sci": m.group(2).strip(),
+            out.append({"common": _demd(m.group(1)), "sci": _demd(m.group(2)),
                         "confidence": int(m.group(3)), "reason": m.group(4).strip()})
     return out
 
