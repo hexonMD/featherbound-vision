@@ -447,6 +447,16 @@ async def panel(
             consensus = {"sci": canon, "common": gem.get("common"),
                          "confidence": gem.get("confidence", 70), "source": "gemini_override",
                          "reason": gem.get("reason")}
+        elif gem.get("confidence", 0) >= 75:
+            # Confident about a species we DON'T have a plate/card for (a recent split, an exotic
+            # cage bird, a hybrid/domestic). Surface Gemini's actual answer (the app shows "not in your
+            # field guide yet") instead of silently swapping to a classifier match — and LOG it so the
+            # misses become a ranked to-add list of species our users actually photograph.
+            consensus = {"sci": gem["sci"], "common": gem.get("common"),
+                         "confidence": gem.get("confidence"), "source": "gemini_offcatalog",
+                         "reason": gem.get("reason"), "in_catalog": False}
+            print("OFFCATALOG " + json.dumps({"sci": gem["sci"], "common": gem.get("common"),
+                                               "region": region, "confidence": gem.get("confidence")}), flush=True)
     if consensus is None:
         top_sci = shortlist[0] if shortlist else (od_scis[0] if od_scis else (bio_scis[0] if bio_scis else None))
         consensus = {"sci": top_sci, "common": None, "confidence": None,
