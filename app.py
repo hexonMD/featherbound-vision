@@ -50,9 +50,9 @@ except Exception as e:
     MERLIN = None
 
 
-def _merlin_topk(img, k=8):
+def _merlin_topk(img, k=8, lat=None, lng=None):
     """Merlin's own top-k. Recipe from the head-to-head: resize min-side to 224, center-crop, raw
-    float32 0-255 (the model normalizes internally), softmax the 7128-way output."""
+    float32 0-255 (the model normalizes internally); model_v55 already outputs softmax probs."""
     if MERLIN is None:
         return None
     try:
@@ -66,7 +66,10 @@ def _merlin_topk(img, k=8):
         outd = MERLIN.get_output_details()[0]
         MERLIN.set_tensor(inp["index"], arr[None])
         MERLIN.invoke()
-        p = MERLIN.get_tensor(outd["index"])[0].astype("float32")   # model_v55 already outputs softmax probs
+        p = MERLIN.get_tensor(outd["index"])[0].astype("float32").copy()   # model_v55 already outputs softmax probs
+        # Range prior: soft multiplicative down-weight for out-of-range species (Mike: even across judges).
+        ok = _range_ok(MERLIN_ROWS, lat, lng)
+        p = p * np.where(ok, 1.0, RANGE_OUT_FACTOR).astype("float32")
         top = np.argsort(p)[-k:][::-1]
         return [{"sci": MERLIN_SCI[i], "score": float(p[i])} for i in top if i < len(MERLIN_SCI)]
     except Exception as ex:
@@ -110,6 +113,48 @@ def _bird_crop(img):
     except Exception as ex:
         print("MERLIN detector infer failed: " + repr(ex), flush=True)
         return None
+
+
+# ---- Range prior (GBIF): give EVERY judge the location signal so the panel is "even" (Mike). It is
+# a SOFT down-weight of out-of-range species, never a hard filter — vagrants/zoo birds stay reachable,
+# and species with no GBIF range data default to in-range. Applied to on-device, BioCLIP and Merlin;
+# Gemini already gets the location in its prompt. Loads only if range_grid.npz is present. ----
+RANGE_GRID = None
+RANGE_HAS = None
+RANGE_HW = (0, 0)
+RANGE_SCI2ROW = {}
+RANGE_OUT_FACTOR = 0.05
+LABEL_ROWS = np.full(len(LABELS), -1, np.int64)
+MERLIN_ROWS = np.full(len(MERLIN_SCI), -1, np.int64) if MERLIN_SCI else np.zeros(0, np.int64)
+try:
+    if os.path.exists("range_grid.npz"):
+        _z = np.load("range_grid.npz", allow_pickle=True)
+        RANGE_HW = (int(_z["shape"][0]), int(_z["shape"][1]))
+        RANGE_GRID = np.unpackbits(_z["packed"], axis=1).reshape(-1, RANGE_HW[0], RANGE_HW[1]).astype(bool)
+        RANGE_HAS = _z["has_data"].astype(bool)
+        _rsci = [ln.strip() for ln in open("range_species.txt", encoding="utf-8")]
+        RANGE_SCI2ROW = {s: i for i, s in enumerate(_rsci)}
+        LABEL_ROWS = np.array([RANGE_SCI2ROW.get(s, -1) for s in LABELS], np.int64)
+        if MERLIN_SCI:
+            MERLIN_ROWS = np.array([RANGE_SCI2ROW.get(s, -1) for s in MERLIN_SCI], np.int64)
+        print(f"RANGE prior loaded: {len(_rsci)} species {RANGE_HW[0]}x{RANGE_HW[1]}", flush=True)
+except Exception as e:
+    print("RANGE load failed (prior disabled): " + repr(e), flush=True)
+    RANGE_GRID = None
+
+
+def _range_ok(rows, lat, lng):
+    """Boolean per-row: True = in range (or unknown species / no location / no grid)."""
+    if RANGE_GRID is None or lat is None or lng is None:
+        return np.ones(len(rows), bool)
+    gH, gW = RANGE_HW
+    r = min(gH - 1, max(0, int((90 - lat) / 180 * gH)))
+    c = min(gW - 1, max(0, int((lng + 180) / 360 * gW)))
+    ok = np.ones(len(rows), bool)
+    valid = rows >= 0
+    vr = rows[valid]
+    ok[valid] = RANGE_GRID[vr, r, c] | ~RANGE_HAS[vr]   # present in cell OR no range data -> keep
+    return ok
 
 app = FastAPI(title="FeatherBound Vision")
 
@@ -227,12 +272,15 @@ async def identify(
 _LABEL_LC = {s.lower(): s for s in LABELS}   # sci (lowercased) -> canonical sci, for validating a VLM pick
 
 
-def _bioclip_topk(img, k=8):
+def _bioclip_topk(img, k=8, lat=None, lng=None):
     x = preprocess(img).unsqueeze(0)
     with torch.no_grad():
         ie = model.encode_image(x)
         ie = (ie / ie.norm(dim=-1, keepdim=True)).cpu().numpy().astype("float32")
-    sims = (ie @ EMB.T)[0]
+    sims = (ie @ EMB.T)[0].copy()
+    # Range prior: soft cosine penalty for species out of range at this location (never a hard filter).
+    ok = _range_ok(LABEL_ROWS, lat, lng)
+    sims = sims - np.where(ok, 0.0, 0.12).astype("float32")
     top = np.argsort(sims)[-k:][::-1]
     return [{"sci": LABELS[i], "score": float(sims[i])} for i in top]
 
@@ -305,22 +353,35 @@ async def panel(
     except Exception:
         raise HTTPException(status_code=400, detail="bad image")
 
-    # Judge A: on-device model (its top-K, handed up from the phone)
+    def _f(s):
+        try:
+            return float(s)
+        except (TypeError, ValueError):
+            return None
+    latf, lngf = _f(lat), _f(lng)
+
+    # Judge A: on-device model (its top-K, handed up from the phone) — range-adjusted so it's even too
     try:
         od = json.loads(ondevice) or []
     except Exception:
         od = []
     od = [d for d in od if isinstance(d, dict) and d.get("sci")]
+    if latf is not None and lngf is not None and od:
+        od_ok = _range_ok(np.array([RANGE_SCI2ROW.get(str(d["sci"]), -1) for d in od], np.int64), latf, lngf)
+        for d, okv in zip(od, od_ok):
+            if not okv:
+                d["confidence"] = float(d.get("confidence", 0) or 0) * RANGE_OUT_FACTOR
+        od.sort(key=lambda d: -float(d.get("confidence", 0) or 0))
     od_scis = [str(d["sci"]) for d in od]
 
-    # Judge B: our hosted BioCLIP-2
-    bio = _bioclip_topk(img, k=8)
+    # Judge B: our hosted BioCLIP-2 (range-adjusted)
+    bio = _bioclip_topk(img, k=8, lat=latf, lng=lngf)
     bio_scis = [d["sci"] for d in bio]
 
-    # Judge D (TEST-ONLY, observational): Merlin, fed a tight detector-crop (its preferred input);
-    # logged for comparison but deliberately NOT fused into the consensus (so stripping it = no-op).
+    # Judge D (TEST-ONLY, observational): Merlin, fed a tight detector-crop (its preferred input) +
+    # the range prior; logged for comparison but deliberately NOT fused into the consensus.
     mcrop = _bird_crop(img)
-    mer = _merlin_topk(mcrop or img, k=8)
+    mer = _merlin_topk(mcrop or img, k=8, lat=latf, lng=lngf)
     mer_scis = [d["sci"] for d in mer] if mer else []
 
     # Fuse the two ranked lists into a shortlist (reciprocal-rank fusion)
