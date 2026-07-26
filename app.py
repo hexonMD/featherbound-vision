@@ -66,13 +66,49 @@ def _merlin_topk(img, k=8):
         outd = MERLIN.get_output_details()[0]
         MERLIN.set_tensor(inp["index"], arr[None])
         MERLIN.invoke()
-        logits = MERLIN.get_tensor(outd["index"])[0].astype("float32")
-        e = np.exp(logits - logits.max())
-        p = e / (e.sum() + 1e-9)
+        p = MERLIN.get_tensor(outd["index"])[0].astype("float32")   # model_v55 already outputs softmax probs
         top = np.argsort(p)[-k:][::-1]
         return [{"sci": MERLIN_SCI[i], "score": float(p[i])} for i in top if i < len(MERLIN_SCI)]
     except Exception as ex:
         print("MERLIN infer failed: " + repr(ex), flush=True)
+        return None
+
+
+# Detector-crop so the Merlin judge gets a tight bird crop (it reaches its real accuracy on crops,
+# not full scenes — head-to-head finding). torchvision COCO fasterrcnn, bird = class 16. Loaded only
+# alongside Merlin (test-only infra). BioCLIP keeps the full scene (it prefers it), so each model
+# gets its preferred input for a fair head-to-head.
+MERLIN_DETECTOR = None
+if MERLIN is not None:
+    try:
+        from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_Weights
+        MERLIN_DETECTOR = fasterrcnn_resnet50_fpn(weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT).eval()
+        print("MERLIN detector loaded", flush=True)
+    except Exception as e:
+        print("MERLIN detector load failed: " + repr(e), flush=True)
+        MERLIN_DETECTOR = None
+
+
+def _bird_crop(img):
+    """Highest-confidence COCO 'bird' box (+15% pad); None if no bird found -> Merlin center-crops."""
+    if MERLIN_DETECTOR is None:
+        return None
+    try:
+        x = torch.from_numpy(np.asarray(img, np.float32).transpose(2, 0, 1) / 255.0)
+        with torch.no_grad():
+            out = MERLIN_DETECTOR([x])[0]
+        boxes, labels, scores = out["boxes"].numpy(), out["labels"].numpy(), out["scores"].numpy()
+        birds = [(b, s) for b, l, s in zip(boxes, labels, scores) if l == 16 and s > 0.3]
+        if not birds:
+            return None
+        b = max(birds, key=lambda bs: bs[1])[0]
+        w, h = img.size
+        x0, y0, x1, y1 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+        pw, ph = (x1 - x0) * 0.15, (y1 - y0) * 0.15
+        return img.crop((int(max(0, x0 - pw)), int(max(0, y0 - ph)),
+                         int(min(w, x1 + pw)), int(min(h, y1 + ph))))
+    except Exception as ex:
+        print("MERLIN detector infer failed: " + repr(ex), flush=True)
         return None
 
 app = FastAPI(title="FeatherBound Vision")
@@ -281,9 +317,10 @@ async def panel(
     bio = _bioclip_topk(img, k=8)
     bio_scis = [d["sci"] for d in bio]
 
-    # Judge D (TEST-ONLY, observational): Merlin. Present only when its model file is on the box;
+    # Judge D (TEST-ONLY, observational): Merlin, fed a tight detector-crop (its preferred input);
     # logged for comparison but deliberately NOT fused into the consensus (so stripping it = no-op).
-    mer = _merlin_topk(img, k=8)
+    mcrop = _bird_crop(img)
+    mer = _merlin_topk(mcrop or img, k=8)
     mer_scis = [d["sci"] for d in mer] if mer else []
 
     # Fuse the two ranked lists into a shortlist (reciprocal-rank fusion)
@@ -328,5 +365,6 @@ async def panel(
               "judges": {"ondevice": od[:8], "bioclip": bio, "merlin": mer, "gemini": gem}}
     print("PANEL " + json.dumps({"consensus": consensus, "region": region, "date": date,
                                  "ondevice_top": od_scis[:1], "bioclip_top": bio_scis[:1],
-                                 "merlin_top": mer_scis[:1], "gemini": (gem or {}).get("sci")}), flush=True)
+                                 "merlin_top": mer_scis[:1], "merlin_cropped": mcrop is not None,
+                                 "gemini": (gem or {}).get("sci")}), flush=True)
     return result
