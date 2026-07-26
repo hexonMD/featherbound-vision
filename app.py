@@ -375,7 +375,39 @@ async def panel(
         od.sort(key=lambda d: -float(d.get("confidence", 0) or 0))
     od_scis = [str(d["sci"]) for d in od]
 
-    # Judge B: our hosted BioCLIP-2 (range-adjusted)
+    # Location/date context, shared by the fast path and the full-panel adjudication.
+    _ctx = []
+    if region.strip():
+        _ctx.append(f"The photo was taken in/near {region.strip()}.")
+    elif lat.strip() and lng.strip():
+        _ctx.append(f"The photo was taken near {lat.strip()}, {lng.strip()}.")
+    if date.strip():
+        _ctx.append(f"Date: {date.strip()}.")
+    ctx_str = " ".join(_ctx)
+
+    # GEMINI-FIRST fast path: adjudicate the PHONE's own candidates with Gemini first. If Gemini agrees
+    # with the phone on an in-catalog species (confident), take it and skip the BioCLIP CPU pass —
+    # faster + cheaper on the easy majority. A disagreement / off-catalog / low-confidence answer falls
+    # through to the full grounded panel below. The phone's guess is a free grounding check, so we never
+    # regress the hard cases (Gemini-alone's invalid "Northwestern Crow" etc.).
+    if GEMINI_API_KEY and od_scis:
+        try:
+            gfast = _gemini_adjudicate(_resize_b64(raw), od_scis[:6], ctx_str)
+        except Exception:
+            gfast = None
+        if gfast and gfast.get("sci"):
+            gf_lc = gfast["sci"].lower()
+            canon = _LABEL_LC.get(gf_lc)
+            if canon and gf_lc in {s.lower() for s in od_scis} and gfast.get("confidence", 0) >= 70:
+                consensus = {"sci": canon, "common": gfast.get("common"),
+                             "confidence": gfast.get("confidence"), "source": "gemini_fast",
+                             "reason": gfast.get("reason")}
+                print("PANEL " + json.dumps({"consensus": consensus, "region": region,
+                                             "fast": True, "ondevice_top": od_scis[:1]}), flush=True)
+                return {"consensus": consensus, "shortlist": od_scis[:5],
+                        "judges": {"ondevice": od[:8], "bioclip": None, "merlin": None, "gemini": gfast}}
+
+    # Judge B: our hosted BioCLIP-2 (range-adjusted) — the grounded fallback for the hard cases.
     bio = _bioclip_topk(img, k=8, lat=latf, lng=lngf)
     bio_scis = [d["sci"] for d in bio]
 
@@ -396,15 +428,8 @@ async def panel(
     # Judge C: Gemini adjudicates the shortlist, with an escape hatch to override it
     gem = None
     if GEMINI_API_KEY and shortlist:
-        ctx = []
-        if region.strip():
-            ctx.append(f"The photo was taken in/near {region.strip()}.")
-        elif lat.strip() and lng.strip():
-            ctx.append(f"The photo was taken near {lat.strip()}, {lng.strip()}.")
-        if date.strip():
-            ctx.append(f"Date: {date.strip()}.")
         try:
-            gem = _gemini_adjudicate(_resize_b64(raw), shortlist, " ".join(ctx))
+            gem = _gemini_adjudicate(_resize_b64(raw), shortlist, ctx_str)
         except Exception:
             gem = None
 
