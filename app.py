@@ -32,6 +32,49 @@ _bank = np.load("bird_bank.npz", allow_pickle=True)
 EMB = _bank["emb"].astype("float32")           # (N, 768) L2-normalized
 LABELS = [str(x) for x in _bank["labels"]]     # eBird scientific names
 
+# ---- Merlin: TEST-ONLY comparison judge (Cornell's model_v55, extracted from the APK). Active ONLY
+# when BOTH the litert runtime AND /app/merlin_v55.tflite are present, so it ships NOWHERE by default.
+# It is OBSERVATIONAL: logged + returned for comparison but never fed into the consensus, so removing
+# it before launch is a no-op. (Legal: Cornell's model — internal benchmarking only, not the product.)
+MERLIN = None
+MERLIN_SCI = []
+try:
+    if os.path.exists("/app/merlin_v55.tflite"):
+        from ai_edge_litert.interpreter import Interpreter as _LiteRT
+        MERLIN = _LiteRT(model_path="/app/merlin_v55.tflite", num_threads=max(1, (os.cpu_count() or 2) - 1))
+        MERLIN.allocate_tensors()
+        MERLIN_SCI = [ln.strip() for ln in open("/app/merlin_sci.txt", encoding="utf-8")]
+        print(f"MERLIN judge loaded: {len(MERLIN_SCI)} classes", flush=True)
+except Exception as e:
+    print("MERLIN load failed (judge disabled): " + repr(e), flush=True)
+    MERLIN = None
+
+
+def _merlin_topk(img, k=8):
+    """Merlin's own top-k. Recipe from the head-to-head: resize min-side to 224, center-crop, raw
+    float32 0-255 (the model normalizes internally), softmax the 7128-way output."""
+    if MERLIN is None:
+        return None
+    try:
+        w, h = img.size
+        s = 224.0 / min(w, h)
+        im = img.resize((round(w * s), round(h * s)), Image.BILINEAR)
+        w, h = im.size
+        l, t = (w - 224) // 2, (h - 224) // 2
+        arr = np.asarray(im.crop((l, t, l + 224, t + 224)), np.float32)
+        inp = MERLIN.get_input_details()[0]
+        outd = MERLIN.get_output_details()[0]
+        MERLIN.set_tensor(inp["index"], arr[None])
+        MERLIN.invoke()
+        logits = MERLIN.get_tensor(outd["index"])[0].astype("float32")
+        e = np.exp(logits - logits.max())
+        p = e / (e.sum() + 1e-9)
+        top = np.argsort(p)[-k:][::-1]
+        return [{"sci": MERLIN_SCI[i], "score": float(p[i])} for i in top if i < len(MERLIN_SCI)]
+    except Exception as ex:
+        print("MERLIN infer failed: " + repr(ex), flush=True)
+        return None
+
 app = FastAPI(title="FeatherBound Vision")
 
 
@@ -238,6 +281,11 @@ async def panel(
     bio = _bioclip_topk(img, k=8)
     bio_scis = [d["sci"] for d in bio]
 
+    # Judge D (TEST-ONLY, observational): Merlin. Present only when its model file is on the box;
+    # logged for comparison but deliberately NOT fused into the consensus (so stripping it = no-op).
+    mer = _merlin_topk(img, k=8)
+    mer_scis = [d["sci"] for d in mer] if mer else []
+
     # Fuse the two ranked lists into a shortlist (reciprocal-rank fusion)
     fused = _rrf([od_scis, bio_scis])
     shortlist = [s for s, _ in sorted(fused.items(), key=lambda kv: -kv[1])][:max(k, 5)]
@@ -277,8 +325,8 @@ async def panel(
                      "source": "classifier", "reason": None}
 
     result = {"consensus": consensus, "shortlist": shortlist,
-              "judges": {"ondevice": od[:8], "bioclip": bio, "gemini": gem}}
+              "judges": {"ondevice": od[:8], "bioclip": bio, "merlin": mer, "gemini": gem}}
     print("PANEL " + json.dumps({"consensus": consensus, "region": region, "date": date,
                                  "ondevice_top": od_scis[:1], "bioclip_top": bio_scis[:1],
-                                 "gemini": (gem or {}).get("sci")}), flush=True)
+                                 "merlin_top": mer_scis[:1], "gemini": (gem or {}).get("sci")}), flush=True)
     return result
