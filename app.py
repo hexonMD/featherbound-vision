@@ -11,7 +11,18 @@ from PIL import Image
 
 MODEL = "hf-hub:imageomics/bioclip-2"
 API_KEY = os.environ.get("VISION_API_KEY", "")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+# A /app/gemini_key.txt (if present) wins over the env var, so the Gemini key can be hot-swapped
+# with just a container restart (no recreate / no model re-download) if the env key gets capped.
+def _gemini_key():
+    try:
+        with open("/app/gemini_key.txt") as f:
+            k = f.read().strip()
+            if k:
+                return k
+    except OSError:
+        pass
+    return os.environ.get("GEMINI_API_KEY", "")
+GEMINI_API_KEY = _gemini_key()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
 torch.set_num_threads(max(1, (os.cpu_count() or 2) - 1))
 
