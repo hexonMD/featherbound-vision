@@ -343,6 +343,7 @@ async def panel(
     date: str = Form(default=""),
     region: str = Form(default=""),       # human place name, optional
     k: int = Form(default=5),
+    merlin: str = Form(default=""),       # "1" to also run the slow test-only Merlin judge (off by default)
     authorization: str = Header(default=""),
 ):
     if API_KEY and authorization != f"Bearer {API_KEY}":
@@ -378,10 +379,14 @@ async def panel(
     bio = _bioclip_topk(img, k=8, lat=latf, lng=lngf)
     bio_scis = [d["sci"] for d in bio]
 
-    # Judge D (TEST-ONLY, observational): Merlin, fed a tight detector-crop (its preferred input) +
-    # the range prior; logged for comparison but deliberately NOT fused into the consensus.
-    mcrop = _bird_crop(img)
-    mer = _merlin_topk(mcrop or img, k=8, lat=latf, lng=lngf)
+    # Judge D (TEST-ONLY, observational): Merlin. It adds a slow CPU detector-crop (~2s) and is NOT
+    # in the consensus, so it runs ONLY when explicitly requested (`merlin=1`). The app skips it, which
+    # keeps the FeatherBound+ call fast (BioCLIP + Gemini only).
+    mcrop = None
+    mer = None
+    if merlin.strip() in ("1", "true", "yes"):
+        mcrop = _bird_crop(img)
+        mer = _merlin_topk(mcrop or img, k=8, lat=latf, lng=lngf)
     mer_scis = [d["sci"] for d in mer] if mer else []
 
     # Fuse the two ranked lists into a shortlist (reciprocal-rank fusion)
