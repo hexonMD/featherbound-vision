@@ -165,12 +165,30 @@ def health():
             "gemini": bool(GEMINI_API_KEY), "gemini_model": GEMINI_MODEL}
 
 
+# Bird-only gate: the BioCLIP bank IS the world's birds, so its labels double as our "is this a
+# bird" whitelist (genus-level, so a valid bird not in the bank still passes). Gemini is a general
+# VLM that will name a lemur ("Indri indri") or a deer as a species — the panel now surfaces its
+# off-catalog picks, so a non-bird could reach the user. We drop anything whose genus isn't a known
+# bird genus, so only birds are ever shown.
+_BIRD_SCI = set(LABELS)
+_BIRD_GENERA = {l.split(" ")[0] for l in LABELS if l}
+def _is_bird(sci: str) -> bool:
+    sci = (sci or "").strip()
+    if sci in _BIRD_SCI:
+        return True
+    return (sci.split(" ")[0] if sci else "") in _BIRD_GENERA
+
+
 GEMINI_PROMPT = (
-    "You are an expert field ornithologist. Identify the bird in this photo. "
-    "The image may be blurry, distant, or low quality. Based only on visible field marks, "
-    "give your top 3 most likely species. For each line use EXACTLY this format:\n"
+    "You are an expert field ornithologist. FIRST decide whether the main subject of the photo is a BIRD. "
+    "If the subject is NOT a bird — for example a mammal, primate, lemur, reptile, amphibian, fish, insect, "
+    "person, plant, or object — respond with EXACTLY one line and nothing else:\n"
+    "NOT_A_BIRD - <what it actually is>\n"
+    "Only if the subject IS a bird, identify it. The image may be blurry, distant, or low quality. Based only "
+    "on visible field marks, give your top 3 most likely BIRD species. For each line use EXACTLY this format:\n"
     "1. Common Name (Scientific name) - NN% - short reason from visible marks\n"
-    "If you genuinely cannot tell, still give your 3 best guesses."
+    "If it is a bird but you genuinely cannot tell the species, still give your 3 best bird guesses. "
+    "Never name a non-bird species."
 )
 _LINE = re.compile(r"^\s*\d+[\.\)]\s*(.+?)\s*\(([^)]+)\)\s*[-–]\s*(\d+)\s*%?\s*[-–]\s*(.+?)\s*$")
 
@@ -238,7 +256,13 @@ async def gemini_id(
     for p in resp.get("candidates", [{}])[0].get("content", {}).get("parts", []):
         if "text" in p:
             txt += p["text"]
-    return {"results": _parse_gemini(txt), "raw": txt.strip(), "model": GEMINI_MODEL}
+    parsed = _parse_gemini(txt)
+    # Bird-only gate: keep only bird species. If Gemini named a non-bird (e.g. "Indri indri", a
+    # lemur), it's dropped; if that leaves nothing OR Gemini said NOT_A_BIRD, return an empty set
+    # so the app shows "not a bird" instead of a bogus find.
+    birds = [r for r in parsed if _is_bird(r.get("sci", ""))]
+    non_bird = ("NOT_A_BIRD" in txt.upper()) or (bool(parsed) and not birds)
+    return {"results": birds, "non_bird": non_bird, "raw": txt.strip(), "model": GEMINI_MODEL}
 
 
 @app.post("/identify")
