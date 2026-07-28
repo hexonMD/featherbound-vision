@@ -391,13 +391,19 @@ async def panel(
     except Exception:
         od = []
     od = [d for d in od if isinstance(d, dict) and d.get("sci")]
+    oor = set()  # scis clearly out-of-range here (GBIF says the species doesn't occur at this location)
     if latf is not None and lngf is not None and od:
         od_ok = _range_ok(np.array([RANGE_SCI2ROW.get(str(d["sci"]), -1) for d in od], np.int64), latf, lngf)
         for d, okv in zip(od, od_ok):
             if not okv:
                 d["confidence"] = float(d.get("confidence", 0) or 0) * RANGE_OUT_FACTOR
+                oor.add(str(d["sci"]).lower())
         od.sort(key=lambda d: -float(d.get("confidence", 0) or 0))
     od_scis = [str(d["sci"]) for d in od]
+    # Shortlist handed to the fast-path Gemini: drop species clearly out-of-range here, so Gemini can't
+    # lock onto an out-of-range look-alike on a blurry photo (e.g. African barbet at a BC location).
+    # Falls back to the full list if that would empty it (no location / all in-range).
+    od_scis_ir = [s for s in od_scis if s.lower() not in oor] or od_scis
 
     # Location/date context, shared by the fast path and the full-panel adjudication.
     _ctx = []
@@ -414,15 +420,20 @@ async def panel(
     # faster + cheaper on the easy majority. A disagreement / off-catalog / low-confidence answer falls
     # through to the full grounded panel below. The phone's guess is a free grounding check, so we never
     # regress the hard cases (Gemini-alone's invalid "Northwestern Crow" etc.).
-    if GEMINI_API_KEY and od_scis:
+    if GEMINI_API_KEY and od_scis_ir:
         try:
-            gfast = _gemini_adjudicate(_resize_b64(raw), od_scis[:6], ctx_str)
+            gfast = _gemini_adjudicate(_resize_b64(raw), od_scis_ir[:6], ctx_str)
         except Exception:
             gfast = None
         if gfast and gfast.get("sci"):
             gf_lc = gfast["sci"].lower()
             canon = _LABEL_LC.get(gf_lc)
-            if canon and gf_lc in {s.lower() for s in od_scis} and gfast.get("confidence", 0) >= 70:
+            # Hard range gate: never take the fast shortcut on a species GBIF says is out-of-range here
+            # — fall through to the grounded panel, which range-demotes the look-alike and lands the
+            # correct local species. (_range_ok returns True when there's no location, so aviary mode
+            # — which drops GPS — is unaffected.)
+            gf_in_range = bool(_range_ok(np.array([RANGE_SCI2ROW.get(canon, -1)], np.int64), latf, lngf)[0]) if canon else False
+            if canon and gf_lc in {s.lower() for s in od_scis_ir} and gfast.get("confidence", 0) >= 70 and gf_in_range:
                 consensus = {"sci": canon, "common": gfast.get("common"),
                              "confidence": gfast.get("confidence"), "source": "gemini_fast",
                              "reason": gfast.get("reason")}
