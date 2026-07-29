@@ -672,6 +672,7 @@ async def panel(
 
     result = {"consensus": consensus, "shortlist": shortlist,
               "has_agentic_pending": bool(agentic_task), "agentic_task_id": agentic_task,
+              "out_of_range": sorted(oor),   # on-device sci names GBIF says don't occur here — app hides these cards
               "judges": {"ondevice": od[:8], "bioclip": None, "merlin": None, "gemini": gem}}
     print("PANEL " + json.dumps({"consensus": consensus, "region": region, "date": date,
                                  "ondevice_top": od_scis[:1], "od_conf": round(od_top_conf, 3),
