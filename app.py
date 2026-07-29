@@ -30,6 +30,10 @@ GEMINI_ESCALATE_MODEL = os.environ.get("GEMINI_ESCALATE_MODEL", "gemini-3.6-flas
 PANEL_CONFIDENT_CONF = float(os.environ.get("PANEL_CONFIDENT_CONF", "0.70"))
 # Below this Gemini confidence the grounded pass is "unsure" → fire the agentic code-execution re-check.
 IDENTIFY_UNSURE_CONF = float(os.environ.get("IDENTIFY_UNSURE_CONF", "70"))
+# Agentic re-check is OFF by default: it works but costs ~32s/call (code_execution loop), which exceeds
+# the CF/proxy gateway timeout (504) synchronously. Ship it async first (grounded result instant, agentic
+# refines the card later), then flip AGENTIC_FALLBACK=1. Flag kept so the capability is one env away.
+AGENTIC_FALLBACK = os.environ.get("AGENTIC_FALLBACK", "0") == "1"
 torch.set_num_threads(max(1, (os.cpu_count() or 2) - 1))
 
 model, _, preprocess = open_clip.create_model_and_transforms(MODEL)
@@ -608,7 +612,7 @@ async def panel(
     # structurally, cracking blurry shots the single pass misses (e.g. the CR ani). ~3x tokens, so only the
     # hard minority pays it. (Mike, 2026-07-28.)
     agentic = False
-    if GEMINI_API_KEY and _identify_unsure(gem):
+    if AGENTIC_FALLBACK and GEMINI_API_KEY and _identify_unsure(gem):
         try:
             ag = _gemini_identify_agentic(crop_b64, ctx_str, od_scis_ir[:6])
             if ag and ag.get("sci"):
