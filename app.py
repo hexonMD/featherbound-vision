@@ -536,7 +536,7 @@ def _consensus_from_gem(gem, sl_lc, od_top, od, latf, lngf, region):
 # Async agentic re-check: the code_execution pass is ~32s (exceeds the gateway timeout), so /panel returns
 # the fast grounded verdict immediately + a task id and runs the deep look in a background thread; the app
 # polls GET /agentic/{id}. In-memory store is fine — single uvicorn container, and the poll hits it.
-AGENTIC_ASYNC = os.environ.get("AGENTIC_ASYNC", "1") == "1"
+AGENTIC_ASYNC = os.environ.get("AGENTIC_ASYNC", "0") == "1"   # OFF by default: real-world testing showed the
 _AGENTIC_TASKS = {}          # id -> {"status": "pending"|"done"|"error", "consensus": {...}|None, "ts": float}
 _AGENTIC_LOCK = threading.Lock()
 _AGENTIC_TTL = 300.0         # forget finished tasks after 5 min
