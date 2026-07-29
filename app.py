@@ -23,7 +23,8 @@ def _gemini_key():
         pass
     return os.environ.get("GEMINI_API_KEY", "")
 GEMINI_API_KEY = _gemini_key()
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")          # cheap default judge
+GEMINI_ESCALATE_MODEL = os.environ.get("GEMINI_ESCALATE_MODEL", "gemini-3.6-flash")  # strong judge (the app's model), hard cases
 torch.set_num_threads(max(1, (os.cpu_count() or 2) - 1))
 
 model, _, preprocess = open_clip.create_model_and_transforms(MODEL)
@@ -320,17 +321,19 @@ def _rrf(rank_lists, kk: int = 60):
 
 
 _PANEL_PROMPT = (
-    "You are an expert field ornithologist adjudicating a bird photo. Two image classifiers proposed "
-    "this shortlist of candidate species (scientific names):\n{shortlist}\n{context}"
-    "Decide which single species the bird most likely is. Strongly prefer a species from the shortlist. "
-    "Only if NONE of them fit the visible field marks, name the correct species yourself. "
-    "Reply on ONE line, EXACTLY in this format:\n"
+    "You are an expert field ornithologist. Identify the bird in this photo to species from its VISIBLE "
+    "FIELD MARKS — plumage, bill shape, body structure, posture, and any behaviour.\n{context}"
+    "The on-device app's best guesses were (often right on common birds, but wrong on unusual, regional, "
+    "or hard-to-photograph ones — use only as a hint, NOT the answer):\n{shortlist}\n"
+    "If the field marks clearly match one of the guesses, confirm it; if they point to a different "
+    "species, name that species instead — your visual judgement outranks the guesses. "
+    "Reply with ONLY ONE line, no preamble or explanation before it, EXACTLY in this format:\n"
     "Common Name (Scientific name) - NN% - short reason from visible marks"
 )
 _ONE = re.compile(r"^\s*(.+?)\s*\(([^)]+)\)\s*[-–]\s*(\d+)\s*%?\s*[-–]\s*(.+?)\s*$")
 
 
-def _gemini_adjudicate(img_b64: str, shortlist_sci, context: str):
+def _gemini_adjudicate(img_b64: str, shortlist_sci, context: str, model: str = None, thinking: int = 0):
     prompt = _PANEL_PROMPT.format(
         shortlist="\n".join(f"- {s}" for s in shortlist_sci),
         context=(context + "\n") if context else "")
@@ -339,10 +342,10 @@ def _gemini_adjudicate(img_b64: str, shortlist_sci, context: str):
             {"inlineData": {"mimeType": "image/jpeg", "data": img_b64}},
             {"text": prompt},
         ]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 200,
-                             "thinkingConfig": {"thinkingBudget": 0}},
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 512,
+                             "thinkingConfig": {"thinkingBudget": thinking}},
     }).encode()
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model or GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
     req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
     with urllib.request.urlopen(req, timeout=60) as r:
         resp = json.load(r)
@@ -356,6 +359,25 @@ def _gemini_adjudicate(img_b64: str, shortlist_sci, context: str):
             return {"common": _demd(m.group(1)), "sci": _demd(m.group(2)),
                     "confidence": int(m.group(3)), "reason": m.group(4).strip(), "raw": txt.strip()}
     return {"raw": txt.strip()}
+
+
+def _panel_unsure(gem, shortlist) -> bool:
+    """Should we escalate the cheap flash-lite judge to the strong (2.5-flash + reasoning) one?
+    Escalate on any sign of a hard/contested call: the light model wants a species off the shortlist,
+    disagrees with the classifiers' #1 pick, gave a low confidence, or didn't parse. (Blind spot, by
+    design: when the phone + BioCLIP + flash-lite all confidently AGREE on the same wrong common bird,
+    nothing looks unsure and we don't escalate — that class needs a stronger base model, not a gate.)"""
+    if not gem or not gem.get("sci"):
+        return True
+    sl = [s.lower() for s in shortlist]
+    g = gem["sci"].lower()
+    if g not in sl:
+        return True                                   # names something off the shortlist
+    if sl and g != sl[0]:
+        return True                                   # disagrees with the classifiers' top pick
+    if (gem.get("confidence") or 0) < 80:
+        return True                                   # not confident
+    return False
 
 
 @app.post("/panel")
@@ -460,13 +482,26 @@ async def panel(
     fused = _rrf([od_scis, bio_scis])
     shortlist = [s for s, _ in sorted(fused.items(), key=lambda kv: -kv[1])][:max(k, 5)]
 
-    # Judge C: Gemini adjudicates the shortlist, with an escape hatch to override it
+    # Judge C: TWO-TIER Gemini. The cheap flash-lite adjudicates first; if it looks unsure we escalate
+    # to the strong model (2.5-flash + reasoning). Best-of-both: flash-lite prices on the easy majority,
+    # the expensive judge only on the hard/contested birds. (Mike, 2026-07-28.)
     gem = None
+    escalated = False
     if GEMINI_API_KEY and shortlist:
+        img_b = _resize_b64(raw)
         try:
-            gem = _gemini_adjudicate(_resize_b64(raw), shortlist, ctx_str)
+            gem = _gemini_adjudicate(img_b, shortlist, ctx_str)          # flash-lite, no thinking
         except Exception:
             gem = None
+        if _panel_unsure(gem, shortlist):
+            try:
+                g2 = _gemini_adjudicate(img_b, shortlist, ctx_str,
+                                        model=GEMINI_ESCALATE_MODEL, thinking=512)  # strong + reasoning
+                if g2 and g2.get("sci"):
+                    gem = g2
+                    escalated = True
+            except Exception:
+                pass
 
     # Consensus: Gemini's pick if valid; agree vs override depending on whether it stayed in the shortlist
     consensus = None
@@ -502,5 +537,5 @@ async def panel(
     print("PANEL " + json.dumps({"consensus": consensus, "region": region, "date": date,
                                  "ondevice_top": od_scis[:1], "bioclip_top": bio_scis[:1],
                                  "merlin_top": mer_scis[:1], "merlin_cropped": mcrop is not None,
-                                 "gemini": (gem or {}).get("sci")}), flush=True)
+                                 "gemini": (gem or {}).get("sci"), "escalated": escalated}), flush=True)
     return result
