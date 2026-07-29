@@ -28,6 +28,8 @@ GEMINI_ESCALATE_MODEL = os.environ.get("GEMINI_ESCALATE_MODEL", "gemini-3.6-flas
 # Cost gate: when the on-device model's top pick is at least this confident, the cheap model confirms it
 # (it's reliable on unmistakable birds); below it we spend the strong model on the genuinely hard birds.
 PANEL_CONFIDENT_CONF = float(os.environ.get("PANEL_CONFIDENT_CONF", "0.70"))
+# Below this Gemini confidence the grounded pass is "unsure" → fire the agentic code-execution re-check.
+IDENTIFY_UNSURE_CONF = float(os.environ.get("IDENTIFY_UNSURE_CONF", "70"))
 torch.set_num_threads(max(1, (os.cpu_count() or 2) - 1))
 
 model, _, preprocess = open_clip.create_model_and_transforms(MODEL)
@@ -443,6 +445,69 @@ def _gemini_identify(img_b64: str, context: str, shortlist_sci=None, model: str 
     return {"raw": txt.strip()}
 
 
+_AGENTIC_PROMPT = (
+    "You are an expert field ornithologist. Identify the bird in this photo to a single species.\n"
+    "{context}"
+    "A bird-recognition model's closest visual matches were:\n{shortlist}\n"
+    "The true bird is most likely one of these or a close relative.\n"
+    "The photo may be blurry — USE CODE EXECUTION to crop/zoom into the bird's HEAD and BILL and contrast-"
+    "stretch it so you can actually read the bill shape and eye, then look again.\n"
+    "Reason: 1) BILL depth/curvature (deep+arched/heavy vs slender+pointed), tail-to-body proportion, posture "
+    "— note what is CLEAR vs masked by blur. 2) candidate families from the silhouette geometry. 3) the single "
+    "best-fit species AT THIS LOCATION by structure — do not default to the commonest species or state a mark "
+    "you cannot see.\n"
+    "If still unclear, give a best guess but LOW confidence (<=55).\n"
+    "Finish with a line, alone, EXACTLY: FINAL: Common Name (Scientific name) - NN% - reason"
+)
+
+
+def _gemini_identify_agentic(img_b64: str, context: str, shortlist_sci=None):
+    """Aggressive re-check for UNCERTAIN birds: gemini-3.6-flash with the code_execution tool (agentic
+    vision). It writes Python to zoom/contrast-stretch the head+bill crop and reasons structurally, pulling
+    signal a single forward pass misses (measured: cracked a blurry Groove-billed Ani that the single pass
+    called a hummingbird). ~3x the tokens of the plain pass (the sandbox re-ingests the image), so it fires
+    only on the hard minority (see IDENTIFY_UNSURE_CONF)."""
+    prompt = _AGENTIC_PROMPT.format(
+        context=(context + "\n") if context else "",
+        shortlist=("\n".join(f"- {s}" for s in shortlist_sci) if shortlist_sci else "- (none available)"))
+    body = json.dumps({
+        "contents": [{"role": "user", "parts": [
+            {"inlineData": {"mimeType": "image/jpeg", "data": img_b64}},
+            {"text": prompt},
+        ]}],
+        "tools": [{"code_execution": {}}],
+        "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8000,
+                             "thinkingConfig": {"thinkingBudget": -1}},
+    }).encode()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_ESCALATE_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=150) as r:
+        resp = json.load(r)
+    txt = ""
+    for p in resp.get("candidates", [{}])[0].get("content", {}).get("parts", []):
+        if "text" in p:
+            txt += p["text"]
+    lines = txt.splitlines()
+    ordered = [l for l in lines if l.strip().upper().startswith("FINAL")] + lines
+    for ln in ordered:
+        cand = ln.strip()
+        if cand.upper().startswith("FINAL"):
+            cand = cand[5:].lstrip(": ").strip()
+        m = _ONE.match(cand)
+        if m:
+            return {"common": _demd(m.group(1)), "sci": _demd(m.group(2)),
+                    "confidence": int(m.group(3)), "reason": m.group(4).strip(), "raw": txt.strip()}
+    return {"raw": txt.strip()}
+
+
+def _identify_unsure(gem) -> bool:
+    """Fire the agentic re-check when the fast grounded pass is unsure — no valid pick, or low confidence.
+    (Low confidence is the honest 'hard bird' signal: robins/grackles come back 95-100 and skip it.)"""
+    if not gem or not gem.get("sci"):
+        return True
+    return (gem.get("confidence") or 0) < IDENTIFY_UNSURE_CONF
+
+
 def _panel_unsure(gem, shortlist) -> bool:
     """Should we escalate the cheap flash-lite judge to the strong (2.5-flash + reasoning) one?
     Escalate on any sign of a hard/contested call: the light model wants a species off the shortlist,
@@ -530,12 +595,27 @@ async def panel(
     # so a suspect pick falls below the threshold and escalates too.
     od_top_conf = float(od[0].get("confidence", 0) or 0) if od else 0.0
     id_model = GEMINI_MODEL if od_top_conf >= PANEL_CONFIDENT_CONF else GEMINI_ESCALATE_MODEL
+    crop_b64 = _crop_b64(img)
     gem = None
     if GEMINI_API_KEY:
         try:
-            gem = _gemini_identify(_crop_b64(img), ctx_str, od_scis_ir[:6], model=id_model)   # grounded on on-device top-K
+            gem = _gemini_identify(crop_b64, ctx_str, od_scis_ir[:6], model=id_model)   # grounded on on-device top-K
         except Exception:
             gem = None
+
+    # Aggressive fallback: on an UNSURE grounded result (no pick / low confidence = a hard bird), re-check
+    # with agentic code-execution vision — Gemini zooms + contrast-stretches the head/bill and reasons
+    # structurally, cracking blurry shots the single pass misses (e.g. the CR ani). ~3x tokens, so only the
+    # hard minority pays it. (Mike, 2026-07-28.)
+    agentic = False
+    if GEMINI_API_KEY and _identify_unsure(gem):
+        try:
+            ag = _gemini_identify_agentic(crop_b64, ctx_str, od_scis_ir[:6])
+            if ag and ag.get("sci"):
+                gem = ag
+                agentic = True
+        except Exception:
+            pass
 
     od_top = od_scis_ir[0] if od_scis_ir else (od_scis[0] if od_scis else None)
     shortlist = (od_scis_ir[:5] or od_scis[:5])
@@ -574,5 +654,6 @@ async def panel(
               "judges": {"ondevice": od[:8], "bioclip": None, "merlin": None, "gemini": gem}}
     print("PANEL " + json.dumps({"consensus": consensus, "region": region, "date": date,
                                  "ondevice_top": od_scis[:1], "od_conf": round(od_top_conf, 3),
-                                 "id_model": id_model, "gemini": (gem or {}).get("sci")}, default=str), flush=True)
+                                 "id_model": id_model, "agentic": agentic,
+                                 "gemini": (gem or {}).get("sci")}, default=str), flush=True)
     return result
