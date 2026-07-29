@@ -83,14 +83,13 @@ def _merlin_topk(img, k=8, lat=None, lng=None):
 # alongside Merlin (test-only infra). BioCLIP keeps the full scene (it prefers it), so each model
 # gets its preferred input for a fair head-to-head.
 MERLIN_DETECTOR = None
-if MERLIN is not None:
-    try:
-        from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_Weights
-        MERLIN_DETECTOR = fasterrcnn_resnet50_fpn(weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT).eval()
-        print("MERLIN detector loaded", flush=True)
-    except Exception as e:
-        print("MERLIN detector load failed: " + repr(e), flush=True)
-        MERLIN_DETECTOR = None
+try:  # loaded ALWAYS now: Gemini needs a tight bird crop to read the bill on look-alikes (Merlin uses it too)
+    from torchvision.models.detection import fasterrcnn_resnet50_fpn, FasterRCNN_ResNet50_FPN_Weights
+    MERLIN_DETECTOR = fasterrcnn_resnet50_fpn(weights=FasterRCNN_ResNet50_FPN_Weights.DEFAULT).eval()
+    print("bird detector loaded (crop for Gemini + Merlin)", flush=True)
+except Exception as e:
+    print("bird detector load failed: " + repr(e), flush=True)
+    MERLIN_DETECTOR = None
 
 
 def _bird_crop(img):
@@ -202,6 +201,21 @@ def _resize_b64(raw: bytes, maxside: int = 1024) -> str:
         im = im.resize((int(w * sc), int(h * sc)))
     b = io.BytesIO(); im.save(b, "JPEG", quality=90)
     return base64.b64encode(b.getvalue()).decode()
+
+
+def _pil_b64(im, maxside: int = 1100) -> str:
+    im = im.convert("RGB"); w, h = im.size
+    if max(w, h) > maxside:
+        sc = maxside / max(w, h); im = im.resize((int(w * sc), int(h * sc)))
+    b = io.BytesIO(); im.save(b, "JPEG", quality=93)
+    return base64.b64encode(b.getvalue()).decode()
+
+
+def _crop_b64(img):
+    """Tight bird crop (detector) before encoding for Gemini — it needs the bill/eye at full spatial
+    resolution to separate look-alikes; on a wide shot it misreads the bill and defaults to the common
+    species. Falls back to the whole image when no bird box is found."""
+    return _pil_b64(_bird_crop(img) or img)
 
 
 def _demd(s: str) -> str:
@@ -321,19 +335,21 @@ def _rrf(rank_lists, kk: int = 60):
 
 
 _PANEL_PROMPT = (
-    "You are an expert field ornithologist. Identify the bird in this photo to species from its VISIBLE "
-    "FIELD MARKS — plumage, bill shape, body structure, posture, and any behaviour.\n{context}"
-    "The on-device app's best guesses were (often right on common birds, but wrong on unusual, regional, "
-    "or hard-to-photograph ones — use only as a hint, NOT the answer):\n{shortlist}\n"
-    "If the field marks clearly match one of the guesses, confirm it; if they point to a different "
-    "species, name that species instead — your visual judgement outranks the guesses. "
-    "Reply with ONLY ONE line, no preamble or explanation before it, EXACTLY in this format:\n"
-    "Common Name (Scientific name) - NN% - short reason from visible marks"
+    "You are an expert field ornithologist. Identify the bird in this photo to species. Reason through "
+    "these steps FIRST, then give the verdict:\n{context}"
+    "1. BILL: describe its shape precisely — dagger-like/straight vs heavy/deep/arched/laterally-"
+    "compressed vs slender/decurved/keeled. Then note tail shape+length, body plumage, and eye colour.\n"
+    "2. The on-device classifiers guessed: {shortlist} — treat these as a hint only, not the answer.\n"
+    "3. Compare the 2-3 species most consistent with those exact field marks AT THIS LOCATION "
+    "(including but NOT limited to the guesses) and explicitly rule out the wrong ones by their bill/"
+    "plumage — do not default to the commonest species if the bill says otherwise.\n"
+    "4. On the LAST line, alone, EXACTLY in this format (no other text on that line):\n"
+    "FINAL: Common Name (Scientific name) - NN% - short reason from the field marks"
 )
 _ONE = re.compile(r"^\s*(.+?)\s*\(([^)]+)\)\s*[-–]\s*(\d+)\s*%?\s*[-–]\s*(.+?)\s*$")
 
 
-def _gemini_adjudicate(img_b64: str, shortlist_sci, context: str, model: str = None, thinking: int = 0):
+def _gemini_adjudicate(img_b64: str, shortlist_sci, context: str, model: str = None, thinking: int = -1):
     prompt = _PANEL_PROMPT.format(
         shortlist="\n".join(f"- {s}" for s in shortlist_sci),
         context=(context + "\n") if context else "")
@@ -342,7 +358,7 @@ def _gemini_adjudicate(img_b64: str, shortlist_sci, context: str, model: str = N
             {"inlineData": {"mimeType": "image/jpeg", "data": img_b64}},
             {"text": prompt},
         ]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 512,
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 3500,
                              "thinkingConfig": {"thinkingBudget": thinking}},
     }).encode()
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model or GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
@@ -353,8 +369,64 @@ def _gemini_adjudicate(img_b64: str, shortlist_sci, context: str, model: str = N
     for p in resp.get("candidates", [{}])[0].get("content", {}).get("parts", []):
         if "text" in p:
             txt += p["text"]
-    for ln in txt.splitlines():
-        m = _ONE.match(ln)
+    lines = txt.splitlines()
+    # Prefer the explicit "FINAL:" verdict line; fall back to any parseable line.
+    ordered = [l for l in lines if l.strip().upper().startswith("FINAL")] + lines
+    for ln in ordered:
+        cand = ln.strip()
+        if cand.upper().startswith("FINAL"):
+            cand = cand[5:].lstrip(": ").strip()
+        m = _ONE.match(cand)
+        if m:
+            return {"common": _demd(m.group(1)), "sci": _demd(m.group(2)),
+                    "confidence": int(m.group(3)), "reason": m.group(4).strip(), "raw": txt.strip()}
+    return {"raw": txt.strip()}
+
+
+_IDENTIFY_PROMPT = (
+    "You are an expert field ornithologist. Identify the bird in this photo to a single species.\n"
+    "{context}"
+    "Look carefully and describe FIRST, before deciding (one short phrase each):\n"
+    "1. BILL — its depth and shape are the most diagnostic feature: slender and pointed, or heavy/deep/"
+    "thick with an arched or humped culmen?\n"
+    "2. TAIL length and shape, body proportions, posture/behaviour, plumage.\n"
+    "Then name the ONE species at this location whose STRUCTURE (especially bill shape) best matches — "
+    "weigh structure over colour, and do not assume the commonest species if the bill shape doesn't fit it.\n"
+    "Finish with a line, alone, EXACTLY in this format (no other text on that line):\n"
+    "FINAL: Common Name (Scientific name) - NN% - short reason from the field marks"
+)
+
+
+def _gemini_identify(img_b64: str, context: str, model: str = None):
+    """Clean, INDEPENDENT species ID from the cropped photo — deliberately NOT told the on-device guess.
+    Naming the phone's pick anchors even the strong model onto the common look-alike (measured: telling it
+    "the classifier guessed Great-tailed Grackle" flips a Groove-billed Ani to Grackle on every run). We
+    reconcile with the on-device model in code afterwards. Runs on the strong app model — the cheap model
+    hallucinates rarities when it has to free-ID without a shortlist."""
+    prompt = _IDENTIFY_PROMPT.format(context=(context + "\n") if context else "")
+    body = json.dumps({
+        "contents": [{"role": "user", "parts": [
+            {"inlineData": {"mimeType": "image/jpeg", "data": img_b64}},
+            {"text": prompt},
+        ]}],
+        "generationConfig": {"temperature": 0.15, "maxOutputTokens": 8000,
+                             "thinkingConfig": {"thinkingBudget": -1}},
+    }).encode()
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model or GEMINI_ESCALATE_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    req = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
+    with urllib.request.urlopen(req, timeout=90) as r:
+        resp = json.load(r)
+    txt = ""
+    for p in resp.get("candidates", [{}])[0].get("content", {}).get("parts", []):
+        if "text" in p:
+            txt += p["text"]
+    lines = txt.splitlines()
+    ordered = [l for l in lines if l.strip().upper().startswith("FINAL")] + lines
+    for ln in ordered:
+        cand = ln.strip()
+        if cand.upper().startswith("FINAL"):
+            cand = cand[5:].lstrip(": ").strip()
+        m = _ONE.match(cand)
         if m:
             return {"common": _demd(m.group(1)), "sci": _demd(m.group(2)),
                     "confidence": int(m.group(3)), "reason": m.group(4).strip(), "raw": txt.strip()}
@@ -437,105 +509,54 @@ async def panel(
         _ctx.append(f"Date: {date.strip()}.")
     ctx_str = " ".join(_ctx)
 
-    # GEMINI-FIRST fast path: adjudicate the PHONE's own candidates with Gemini first. If Gemini agrees
-    # with the phone on an in-catalog species (confident), take it and skip the BioCLIP CPU pass —
-    # faster + cheaper on the easy majority. A disagreement / off-catalog / low-confidence answer falls
-    # through to the full grounded panel below. The phone's guess is a free grounding check, so we never
-    # regress the hard cases (Gemini-alone's invalid "Northwestern Crow" etc.).
-    if GEMINI_API_KEY and od_scis_ir:
-        try:
-            gfast = _gemini_adjudicate(_resize_b64(raw), od_scis_ir[:6], ctx_str)
-        except Exception:
-            gfast = None
-        if gfast and gfast.get("sci"):
-            gf_lc = gfast["sci"].lower()
-            canon = _LABEL_LC.get(gf_lc)
-            # Hard range gate: never take the fast shortcut on a species GBIF says is out-of-range here
-            # — fall through to the grounded panel, which range-demotes the look-alike and lands the
-            # correct local species. (_range_ok returns True when there's no location, so aviary mode
-            # — which drops GPS — is unaffected.)
-            gf_in_range = bool(_range_ok(np.array([RANGE_SCI2ROW.get(canon, -1)], np.int64), latf, lngf)[0]) if canon else False
-            if canon and gf_lc in {s.lower() for s in od_scis_ir} and gfast.get("confidence", 0) >= 70 and gf_in_range:
-                consensus = {"sci": canon, "common": gfast.get("common"),
-                             "confidence": gfast.get("confidence"), "source": "gemini_fast",
-                             "reason": gfast.get("reason")}
-                print("PANEL " + json.dumps({"consensus": consensus, "region": region,
-                                             "fast": True, "ondevice_top": od_scis[:1]}), flush=True)
-                return {"consensus": consensus, "shortlist": od_scis[:5],
-                        "judges": {"ondevice": od[:8], "bioclip": None, "merlin": None, "gemini": gfast}}
-
-    # Judge B: our hosted BioCLIP-2 (range-adjusted) — the grounded fallback for the hard cases.
-    bio = _bioclip_topk(img, k=8, lat=latf, lng=lngf)
-    bio_scis = [d["sci"] for d in bio]
-
-    # Judge D (TEST-ONLY, observational): Merlin. It adds a slow CPU detector-crop (~2s) and is NOT
-    # in the consensus, so it runs ONLY when explicitly requested (`merlin=1`). The app skips it, which
-    # keeps the FeatherBound+ call fast (BioCLIP + Gemini only).
-    mcrop = None
-    mer = None
-    if merlin.strip() in ("1", "true", "yes"):
-        mcrop = _bird_crop(img)
-        mer = _merlin_topk(mcrop or img, k=8, lat=latf, lng=lngf)
-    mer_scis = [d["sci"] for d in mer] if mer else []
-
-    # Fuse the two ranked lists into a shortlist (reciprocal-rank fusion)
-    fused = _rrf([od_scis, bio_scis])
-    shortlist = [s for s, _ in sorted(fused.items(), key=lambda kv: -kv[1])][:max(k, 5)]
-
-    # Judge C: TWO-TIER Gemini. The cheap flash-lite adjudicates first; if it looks unsure we escalate
-    # to the strong model (2.5-flash + reasoning). Best-of-both: flash-lite prices on the easy majority,
-    # the expensive judge only on the hard/contested birds. (Mike, 2026-07-28.)
+    # GEMINI-FIRST, on-device + Gemini only (BioCLIP retired — it misfired on busy real-world scenes,
+    # e.g. a Fijian sparrowhawk as top pick for a Costa Rica photo). We do NOT hand Gemini the phone's
+    # guess: naming it anchors even the strong model onto the common look-alike (measured: it flips a
+    # Groove-billed Ani to Great-tailed Grackle every run). Gemini IDs the cropped bird cleanly, then we
+    # reconcile with the on-device model in code. (Mike, 2026-07-28.)
     gem = None
-    escalated = False
-    if GEMINI_API_KEY and shortlist:
-        img_b = _resize_b64(raw)
+    if GEMINI_API_KEY:
         try:
-            gem = _gemini_adjudicate(img_b, shortlist, ctx_str)          # flash-lite, no thinking
+            gem = _gemini_identify(_crop_b64(img), ctx_str)   # strong model, clean free-ID, no phone hint
         except Exception:
             gem = None
-        if _panel_unsure(gem, shortlist):
-            try:
-                g2 = _gemini_adjudicate(img_b, shortlist, ctx_str,
-                                        model=GEMINI_ESCALATE_MODEL, thinking=512)  # strong + reasoning
-                if g2 and g2.get("sci"):
-                    gem = g2
-                    escalated = True
-            except Exception:
-                pass
 
-    # Consensus: Gemini's pick if valid; agree vs override depending on whether it stayed in the shortlist
-    consensus = None
+    od_top = od_scis_ir[0] if od_scis_ir else (od_scis[0] if od_scis else None)
+    shortlist = (od_scis_ir[:5] or od_scis[:5])
     sl_lc = {s.lower() for s in shortlist}
+
+    consensus = None
     if gem and gem.get("sci"):
         gsci_lc = gem["sci"].lower()
         canon = _LABEL_LC.get(gsci_lc)
-        if gsci_lc in sl_lc:
-            consensus = {"sci": canon or gem["sci"], "common": gem.get("common"),
-                         "confidence": gem.get("confidence", 80), "source": "agree",
-                         "reason": gem.get("reason")}
-        elif canon:
+        # Range gate: if Gemini names an in-catalog species GBIF says is out of range here AND it's not
+        # what the phone saw AND it isn't highly confident, distrust it (a hallucinated exotic) and defer
+        # to the phone. (_range_ok returns True with no location, so aviary/no-GPS mode is unaffected.)
+        g_in_range = bool(_range_ok(np.array([RANGE_SCI2ROW.get(canon, -1)], np.int64), latf, lngf)[0]) if canon else True
+        if canon and (gsci_lc in sl_lc or g_in_range or gem.get("confidence", 0) >= 85):
+            src = "agree" if (od_top and gsci_lc == od_top.lower()) else "gemini"
             consensus = {"sci": canon, "common": gem.get("common"),
-                         "confidence": gem.get("confidence", 70), "source": "gemini_override",
+                         "confidence": gem.get("confidence", 80), "source": src,
                          "reason": gem.get("reason")}
-        elif gem.get("confidence", 0) >= 75:
-            # Confident about a species we DON'T have a plate/card for (a recent split, an exotic
-            # cage bird, a hybrid/domestic). Surface Gemini's actual answer (the app shows "not in your
-            # field guide yet") instead of silently swapping to a classifier match — and LOG it so the
-            # misses become a ranked to-add list of species our users actually photograph.
+        elif not canon and gem.get("confidence", 0) >= 75:
+            # Confident about a species we DON'T have a plate/card for (a recent split, an exotic cage
+            # bird, a hybrid/domestic). Surface Gemini's actual answer (the app shows "not in your field
+            # guide yet") instead of silently swapping to a classifier match — and LOG it so the misses
+            # become a ranked to-add list of species our users actually photograph.
             consensus = {"sci": gem["sci"], "common": gem.get("common"),
                          "confidence": gem.get("confidence"), "source": "gemini_offcatalog",
                          "reason": gem.get("reason"), "in_catalog": False}
             print("OFFCATALOG " + json.dumps({"sci": gem["sci"], "common": gem.get("common"),
                                                "region": region, "confidence": gem.get("confidence")}), flush=True)
     if consensus is None:
-        top_sci = shortlist[0] if shortlist else (od_scis[0] if od_scis else (bio_scis[0] if bio_scis else None))
-        consensus = {"sci": top_sci, "common": None, "confidence": None,
+        # Gemini failed / unusable → the on-device model's best IN-RANGE pick (never a raw out-of-range guess).
+        consensus = {"sci": od_top, "common": (od[0].get("common") if od else None),
+                     "confidence": int((od[0].get("confidence", 0) or 0) * 100) if od else None,
                      "source": "classifier", "reason": None}
 
     result = {"consensus": consensus, "shortlist": shortlist,
-              "judges": {"ondevice": od[:8], "bioclip": bio, "merlin": mer, "gemini": gem}}
+              "judges": {"ondevice": od[:8], "bioclip": None, "merlin": None, "gemini": gem}}
     print("PANEL " + json.dumps({"consensus": consensus, "region": region, "date": date,
-                                 "ondevice_top": od_scis[:1], "bioclip_top": bio_scis[:1],
-                                 "merlin_top": mer_scis[:1], "merlin_cropped": mcrop is not None,
-                                 "gemini": (gem or {}).get("sci"), "escalated": escalated}), flush=True)
+                                 "ondevice_top": od_scis[:1],
+                                 "gemini": (gem or {}).get("sci")}, default=str), flush=True)
     return result
