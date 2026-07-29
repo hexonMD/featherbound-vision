@@ -519,41 +519,26 @@ async def panel(
         _ctx.append(f"Date: {date.strip()}.")
     ctx_str = " ".join(_ctx)
 
-    # HIGH-RECALL candidate generation → Gemini VERIFIES. On a blurry photo Gemini free-IDs into confident
-    # nonsense (a CR ani → hummingbird/barbet), but it's a strong verifier of a candidate SET — so we hand it
-    # a wide, location-appropriate list and let it pick by field marks. Candidates = on-device top-K + BioCLIP
-    # top-N on the bird crop. BioCLIP is a CONTRIBUTOR, never the decider (its top-1 misfires — a Fijian hawk
-    # for a CR shot — but its top-N widens the net so long-tail species like the ani reach Gemini). We
-    # range-filter the list so out-of-range look-alikes never enter it (skipped with no location = aviary).
-    bird = _bird_crop(img) or img
-    crop_b64 = _pil_b64(bird)
-    bio = _bioclip_topk(bird, k=15, lat=latf, lng=lngf) if GEMINI_API_KEY else []
-    bio_scis = [d["sci"] for d in bio]
-    have_loc = latf is not None and lngf is not None
-    candidates, _seen = [], set()
-    for s in list(od_scis_ir) + bio_scis:
-        lc = s.lower()
-        if lc in _seen:
-            continue
-        if have_loc and not bool(_range_ok(np.array([RANGE_SCI2ROW.get(s, -1)], np.int64), latf, lngf)[0]):
-            continue                                   # out-of-range here — keep it out of Gemini's list
-        _seen.add(lc); candidates.append(s)
-    candidates = (candidates or od_scis_ir or od_scis)[:10]
-
-    # Cost gate: a confident on-device pick is confirmed by the CHEAP model; uncertain birds (the hard
-    # look-alikes) escalate to the strong model. Out-of-range picks are conf-demoted upstream, so a suspect
-    # pick falls below the threshold and escalates too. (Mike, 2026-07-28.)
+    # GEMINI-FIRST, on-device + Gemini only (BioCLIP retired — it misfired on busy real-world scenes,
+    # e.g. a Fijian sparrowhawk as top pick for a Costa Rica photo). We do NOT hand Gemini the phone's
+    # guess: naming it anchors even the strong model onto the common look-alike (measured: it flips a
+    # Groove-billed Ani to Great-tailed Grackle every run). Gemini IDs the cropped bird cleanly, then we
+    # reconcile with the on-device model in code. (Mike, 2026-07-28.)
+    # Cost gate (Mike, 2026-07-28): a confident on-device pick is confirmed by the CHEAP model — it nails
+    # unmistakable birds and just agrees; only uncertain birds (the hard look-alikes flash-lite gets
+    # confidently wrong) escalate to the strong model. Out-of-range picks are already conf-demoted upstream,
+    # so a suspect pick falls below the threshold and escalates too.
     od_top_conf = float(od[0].get("confidence", 0) or 0) if od else 0.0
     id_model = GEMINI_MODEL if od_top_conf >= PANEL_CONFIDENT_CONF else GEMINI_ESCALATE_MODEL
     gem = None
     if GEMINI_API_KEY:
         try:
-            gem = _gemini_identify(crop_b64, ctx_str, candidates, model=id_model)   # grounded on the wide candidate list
+            gem = _gemini_identify(_crop_b64(img), ctx_str, od_scis_ir[:6], model=id_model)   # grounded on on-device top-K
         except Exception:
             gem = None
 
     od_top = od_scis_ir[0] if od_scis_ir else (od_scis[0] if od_scis else None)
-    shortlist = candidates[:8] or (od_scis_ir[:5] or od_scis[:5])
+    shortlist = (od_scis_ir[:5] or od_scis[:5])
     sl_lc = {s.lower() for s in shortlist}
 
     consensus = None
@@ -585,10 +570,9 @@ async def panel(
                      "confidence": int((od[0].get("confidence", 0) or 0) * 100) if od else None,
                      "source": "classifier", "reason": None}
 
-    result = {"consensus": consensus, "shortlist": shortlist, "candidates": candidates,
-              "judges": {"ondevice": od[:8], "bioclip": bio[:12], "merlin": None, "gemini": gem}}
+    result = {"consensus": consensus, "shortlist": shortlist,
+              "judges": {"ondevice": od[:8], "bioclip": None, "merlin": None, "gemini": gem}}
     print("PANEL " + json.dumps({"consensus": consensus, "region": region, "date": date,
                                  "ondevice_top": od_scis[:1], "od_conf": round(od_top_conf, 3),
-                                 "id_model": id_model, "candidates": candidates[:8],
-                                 "gemini": (gem or {}).get("sci")}, default=str), flush=True)
+                                 "id_model": id_model, "gemini": (gem or {}).get("sci")}, default=str), flush=True)
     return result
