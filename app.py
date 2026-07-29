@@ -25,6 +25,9 @@ def _gemini_key():
 GEMINI_API_KEY = _gemini_key()
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.1-flash-lite")          # cheap default judge
 GEMINI_ESCALATE_MODEL = os.environ.get("GEMINI_ESCALATE_MODEL", "gemini-3.6-flash")  # strong judge (the app's model), hard cases
+# Cost gate: when the on-device model's top pick is at least this confident, the cheap model confirms it
+# (it's reliable on unmistakable birds); below it we spend the strong model on the genuinely hard birds.
+PANEL_CONFIDENT_CONF = float(os.environ.get("PANEL_CONFIDENT_CONF", "0.70"))
 torch.set_num_threads(max(1, (os.cpu_count() or 2) - 1))
 
 model, _, preprocess = open_clip.create_model_and_transforms(MODEL)
@@ -514,10 +517,16 @@ async def panel(
     # guess: naming it anchors even the strong model onto the common look-alike (measured: it flips a
     # Groove-billed Ani to Great-tailed Grackle every run). Gemini IDs the cropped bird cleanly, then we
     # reconcile with the on-device model in code. (Mike, 2026-07-28.)
+    # Cost gate (Mike, 2026-07-28): a confident on-device pick is confirmed by the CHEAP model — it nails
+    # unmistakable birds and just agrees; only uncertain birds (the hard look-alikes flash-lite gets
+    # confidently wrong) escalate to the strong model. Out-of-range picks are already conf-demoted upstream,
+    # so a suspect pick falls below the threshold and escalates too.
+    od_top_conf = float(od[0].get("confidence", 0) or 0) if od else 0.0
+    id_model = GEMINI_MODEL if od_top_conf >= PANEL_CONFIDENT_CONF else GEMINI_ESCALATE_MODEL
     gem = None
     if GEMINI_API_KEY:
         try:
-            gem = _gemini_identify(_crop_b64(img), ctx_str)   # strong model, clean free-ID, no phone hint
+            gem = _gemini_identify(_crop_b64(img), ctx_str, model=id_model)   # clean free-ID, no phone hint
         except Exception:
             gem = None
 
@@ -557,6 +566,6 @@ async def panel(
     result = {"consensus": consensus, "shortlist": shortlist,
               "judges": {"ondevice": od[:8], "bioclip": None, "merlin": None, "gemini": gem}}
     print("PANEL " + json.dumps({"consensus": consensus, "region": region, "date": date,
-                                 "ondevice_top": od_scis[:1],
-                                 "gemini": (gem or {}).get("sci")}, default=str), flush=True)
+                                 "ondevice_top": od_scis[:1], "od_conf": round(od_top_conf, 3),
+                                 "id_model": id_model, "gemini": (gem or {}).get("sci")}, default=str), flush=True)
     return result
