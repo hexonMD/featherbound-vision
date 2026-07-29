@@ -389,24 +389,31 @@ def _gemini_adjudicate(img_b64: str, shortlist_sci, context: str, model: str = N
 _IDENTIFY_PROMPT = (
     "You are an expert field ornithologist. Identify the bird in this photo to a single species.\n"
     "{context}"
-    "Look carefully and describe FIRST, before deciding (one short phrase each):\n"
-    "1. BILL — its depth and shape are the most diagnostic feature: slender and pointed, or heavy/deep/"
-    "thick with an arched or humped culmen?\n"
-    "2. TAIL length and shape, body proportions, posture/behaviour, plumage.\n"
-    "Then name the ONE species at this location whose STRUCTURE (especially bill shape) best matches — "
-    "weigh structure over colour, and do not assume the commonest species if the bill shape doesn't fit it.\n"
+    "A bird-recognition model looked at THIS photo; its closest visual matches were:\n{shortlist}\n"
+    "The true bird is most likely one of these or a close relative. Work through it:\n"
+    "1. Describe ONLY what you can actually see — BILL depth/shape (the most diagnostic feature), tail, body "
+    "proportions, posture, plumage. If the bird is blurry, small, or distant, say which marks are unclear; do "
+    "NOT state a field mark you cannot clearly see.\n"
+    "2. Compare the candidates above against those marks and pick the best fit. You may name a species NOT in "
+    "the list ONLY if you can cite specific visible marks that rule out every candidate — do not switch to a "
+    "locally-common species on a hunch, and never invent a bill or plumage you can't see.\n"
+    "3. If the photo is too unclear to be confident, still give your best guess but a LOW confidence (<=55).\n"
     "Finish with a line, alone, EXACTLY in this format (no other text on that line):\n"
-    "FINAL: Common Name (Scientific name) - NN% - short reason from the field marks"
+    "FINAL: Common Name (Scientific name) - NN% - short reason from the visible marks"
 )
 
 
-def _gemini_identify(img_b64: str, context: str, model: str = None):
-    """Clean, INDEPENDENT species ID from the cropped photo — deliberately NOT told the on-device guess.
-    Naming the phone's pick anchors even the strong model onto the common look-alike (measured: telling it
-    "the classifier guessed Great-tailed Grackle" flips a Groove-billed Ani to Grackle on every run). We
-    reconcile with the on-device model in code afterwards. Runs on the strong app model — the cheap model
-    hallucinates rarities when it has to free-ID without a shortlist."""
-    prompt = _IDENTIFY_PROMPT.format(context=(context + "\n") if context else "")
+def _gemini_identify(img_b64: str, context: str, shortlist_sci=None, model: str = None):
+    """Species ID from the cropped photo, GROUNDED on the on-device model's closest matches. Pure free-ID
+    (no shortlist) was measured to hallucinate a confident random local species on blurry/ambiguous photos
+    (a Costa Rica ani → Long-billed Hermit / barbet / finch, inventing field marks); anchoring on ONE guess
+    instead made the model rubber-stamp the common look-alike. The middle path — the on-device top-K as
+    grounding, override only with cited visible marks, no defaulting to the locally-common species, and a low
+    confidence when the image is unclear — keeps clear photos sharp while staying in the right family on hard
+    ones. We reconcile the pick with the on-device model in code afterwards."""
+    prompt = _IDENTIFY_PROMPT.format(
+        context=(context + "\n") if context else "",
+        shortlist=("\n".join(f"- {s}" for s in shortlist_sci) if shortlist_sci else "- (none available)"))
     body = json.dumps({
         "contents": [{"role": "user", "parts": [
             {"inlineData": {"mimeType": "image/jpeg", "data": img_b64}},
@@ -526,7 +533,7 @@ async def panel(
     gem = None
     if GEMINI_API_KEY:
         try:
-            gem = _gemini_identify(_crop_b64(img), ctx_str, model=id_model)   # clean free-ID, no phone hint
+            gem = _gemini_identify(_crop_b64(img), ctx_str, od_scis_ir[:6], model=id_model)   # grounded on on-device top-K
         except Exception:
             gem = None
 
