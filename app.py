@@ -2,7 +2,7 @@
 - POST /identify   (BioCLIP 2 embedding ID over ~11k birds) -> top-k {sci, score}
 - POST /gemini-id  (general VLM read for HARD/blurry photos the on-device model + BioCLIP miss)
 Both bearer-key protected. Only hit when the on-device ensemble is unsure / regionally implausible."""
-import io, os, re, json, base64, urllib.request, urllib.error
+import io, os, re, json, base64, time, uuid, threading, urllib.request, urllib.error
 import numpy as np
 import torch
 import open_clip
@@ -512,6 +512,49 @@ def _identify_unsure(gem) -> bool:
     return (gem.get("confidence") or 0) < IDENTIFY_UNSURE_CONF
 
 
+def _consensus_from_gem(gem, sl_lc, od_top, od, latf, lngf, region):
+    """Reconcile a Gemini verdict into a consensus dict (agree / gemini / gemini_offcatalog), range-gated,
+    falling back to the on-device best in-range pick. Shared by the sync panel and the async agentic worker."""
+    if gem and gem.get("sci"):
+        gsci_lc = gem["sci"].lower()
+        canon = _LABEL_LC.get(gsci_lc)
+        g_in_range = bool(_range_ok(np.array([RANGE_SCI2ROW.get(canon, -1)], np.int64), latf, lngf)[0]) if canon else True
+        if canon and (gsci_lc in sl_lc or g_in_range or gem.get("confidence", 0) >= 85):
+            src = "agree" if (od_top and gsci_lc == od_top.lower()) else "gemini"
+            return {"sci": canon, "common": gem.get("common"), "confidence": gem.get("confidence", 80),
+                    "source": src, "reason": gem.get("reason")}
+        if not canon and gem.get("confidence", 0) >= 75:
+            print("OFFCATALOG " + json.dumps({"sci": gem["sci"], "common": gem.get("common"),
+                                               "region": region, "confidence": gem.get("confidence")}), flush=True)
+            return {"sci": gem["sci"], "common": gem.get("common"), "confidence": gem.get("confidence"),
+                    "source": "gemini_offcatalog", "reason": gem.get("reason"), "in_catalog": False}
+    return {"sci": od_top, "common": (od[0].get("common") if od else None),
+            "confidence": int((od[0].get("confidence", 0) or 0) * 100) if od else None,
+            "source": "classifier", "reason": None}
+
+
+# Async agentic re-check: the code_execution pass is ~32s (exceeds the gateway timeout), so /panel returns
+# the fast grounded verdict immediately + a task id and runs the deep look in a background thread; the app
+# polls GET /agentic/{id}. In-memory store is fine — single uvicorn container, and the poll hits it.
+AGENTIC_ASYNC = os.environ.get("AGENTIC_ASYNC", "1") == "1"
+_AGENTIC_TASKS = {}          # id -> {"status": "pending"|"done"|"error", "consensus": {...}|None, "ts": float}
+_AGENTIC_LOCK = threading.Lock()
+_AGENTIC_TTL = 300.0         # forget finished tasks after 5 min
+
+
+def _agentic_worker(task_id, crop_b64, ctx_str, candidates, sl_lc, od_top, od, latf, lngf, region):
+    try:
+        ag = _gemini_identify_agentic(crop_b64, ctx_str, candidates)
+        cons = _consensus_from_gem(ag, sl_lc, od_top, od, latf, lngf, region) if (ag and ag.get("sci")) else None
+        st = {"status": "done", "consensus": cons, "ts": time.time()}
+        print("AGENTIC-DONE " + json.dumps({"task": task_id[:8], "consensus": cons}, default=str), flush=True)
+    except Exception as ex:
+        st = {"status": "error", "consensus": None, "ts": time.time()}
+        print("AGENTIC-ERR " + repr(ex), flush=True)
+    with _AGENTIC_LOCK:
+        _AGENTIC_TASKS[task_id] = st
+
+
 def _panel_unsure(gem, shortlist) -> bool:
     """Should we escalate the cheap flash-lite judge to the strong (2.5-flash + reasoning) one?
     Escalate on any sign of a hard/contested call: the light model wants a species off the shortlist,
@@ -607,57 +650,44 @@ async def panel(
         except Exception:
             gem = None
 
-    # Aggressive fallback: on an UNSURE grounded result (no pick / low confidence = a hard bird), re-check
-    # with agentic code-execution vision — Gemini zooms + contrast-stretches the head/bill and reasons
-    # structurally, cracking blurry shots the single pass misses (e.g. the CR ani). ~3x tokens, so only the
-    # hard minority pays it. (Mike, 2026-07-28.)
-    agentic = False
-    if AGENTIC_FALLBACK and GEMINI_API_KEY and _identify_unsure(gem):
-        try:
-            ag = _gemini_identify_agentic(crop_b64, ctx_str, od_scis_ir[:6])
-            if ag and ag.get("sci"):
-                gem = ag
-                agentic = True
-        except Exception:
-            pass
-
     od_top = od_scis_ir[0] if od_scis_ir else (od_scis[0] if od_scis else None)
     shortlist = (od_scis_ir[:5] or od_scis[:5])
     sl_lc = {s.lower() for s in shortlist}
+    consensus = _consensus_from_gem(gem, sl_lc, od_top, od, latf, lngf, region)
 
-    consensus = None
-    if gem and gem.get("sci"):
-        gsci_lc = gem["sci"].lower()
-        canon = _LABEL_LC.get(gsci_lc)
-        # Range gate: if Gemini names an in-catalog species GBIF says is out of range here AND it's not
-        # what the phone saw AND it isn't highly confident, distrust it (a hallucinated exotic) and defer
-        # to the phone. (_range_ok returns True with no location, so aviary/no-GPS mode is unaffected.)
-        g_in_range = bool(_range_ok(np.array([RANGE_SCI2ROW.get(canon, -1)], np.int64), latf, lngf)[0]) if canon else True
-        if canon and (gsci_lc in sl_lc or g_in_range or gem.get("confidence", 0) >= 85):
-            src = "agree" if (od_top and gsci_lc == od_top.lower()) else "gemini"
-            consensus = {"sci": canon, "common": gem.get("common"),
-                         "confidence": gem.get("confidence", 80), "source": src,
-                         "reason": gem.get("reason")}
-        elif not canon and gem.get("confidence", 0) >= 75:
-            # Confident about a species we DON'T have a plate/card for (a recent split, an exotic cage
-            # bird, a hybrid/domestic). Surface Gemini's actual answer (the app shows "not in your field
-            # guide yet") instead of silently swapping to a classifier match — and LOG it so the misses
-            # become a ranked to-add list of species our users actually photograph.
-            consensus = {"sci": gem["sci"], "common": gem.get("common"),
-                         "confidence": gem.get("confidence"), "source": "gemini_offcatalog",
-                         "reason": gem.get("reason"), "in_catalog": False}
-            print("OFFCATALOG " + json.dumps({"sci": gem["sci"], "common": gem.get("common"),
-                                               "region": region, "confidence": gem.get("confidence")}), flush=True)
-    if consensus is None:
-        # Gemini failed / unusable → the on-device model's best IN-RANGE pick (never a raw out-of-range guess).
-        consensus = {"sci": od_top, "common": (od[0].get("common") if od else None),
-                     "confidence": int((od[0].get("confidence", 0) or 0) * 100) if od else None,
-                     "source": "classifier", "reason": None}
+    # ASYNC agentic deep-look: on an UNSURE fast result, kick off the ~32s code-execution re-check in a
+    # background thread and hand the app a task id to poll (GET /agentic/{id}). The fast verdict returns NOW,
+    # so no gateway timeout; the card refreshes if the deep look shifts the ID (e.g. grackle → ani).
+    agentic_task = None
+    if AGENTIC_ASYNC and GEMINI_API_KEY and _identify_unsure(gem):
+        agentic_task = uuid.uuid4().hex
+        with _AGENTIC_LOCK:
+            now = time.time()
+            for _k in [k for k, v in _AGENTIC_TASKS.items() if now - v.get("ts", now) > _AGENTIC_TTL]:
+                _AGENTIC_TASKS.pop(_k, None)
+            _AGENTIC_TASKS[agentic_task] = {"status": "pending", "consensus": None, "ts": now}
+        threading.Thread(target=_agentic_worker, daemon=True,
+                         args=(agentic_task, crop_b64, ctx_str, od_scis_ir[:6],
+                               sl_lc, od_top, od, latf, lngf, region)).start()
 
     result = {"consensus": consensus, "shortlist": shortlist,
+              "has_agentic_pending": bool(agentic_task), "agentic_task_id": agentic_task,
               "judges": {"ondevice": od[:8], "bioclip": None, "merlin": None, "gemini": gem}}
     print("PANEL " + json.dumps({"consensus": consensus, "region": region, "date": date,
                                  "ondevice_top": od_scis[:1], "od_conf": round(od_top_conf, 3),
-                                 "id_model": id_model, "agentic": agentic,
+                                 "id_model": id_model, "agentic_pending": bool(agentic_task),
                                  "gemini": (gem or {}).get("sci")}, default=str), flush=True)
     return result
+
+
+@app.get("/agentic/{task_id}")
+async def agentic_status(task_id: str, authorization: str = Header(default="")):
+    """Poll the async agentic deep-look. `pending` = still running (~32s); `done` returns the refined
+    consensus (may equal the fast one, or shift the ID); `unknown` = expired/never existed."""
+    if API_KEY and authorization != f"Bearer {API_KEY}":
+        raise HTTPException(status_code=401, detail="unauthorized")
+    with _AGENTIC_LOCK:
+        t = _AGENTIC_TASKS.get(task_id)
+    if not t:
+        return {"status": "unknown"}
+    return {"status": t["status"], "consensus": t.get("consensus")}
